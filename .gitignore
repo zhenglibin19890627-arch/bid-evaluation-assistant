@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 运行产物与本地数据（严禁提交）
+项目类型选择.json
+时间范围选择.json
+增量状态.json
+analysis_result.json
+标书映射.json
+*_初筛结果.xlsx
+*_研判报告.md
+*_采购公告_*.xlsx
+*政府采购公告*.xlsx
+*_高亮版.xlsx
+待研判清单_*.xlsx
+
+# 浏览器登录态与申请信息（本机敏感，严禁提交）
+storage_state.json
+申请信息.json
+
+# IDE/系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

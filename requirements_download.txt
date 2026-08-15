@@ -1,0 +1,5 @@
+# 可选依赖：自动下载招标文件（浏览器登录方案）需要
+# 安装方式：
+#   pip install -r requirements_download.txt
+#   python -m playwright install chromium
+playwright>=1.40.0

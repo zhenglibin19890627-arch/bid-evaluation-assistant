@@ -1,0 +1,1317 @@
+# -*- coding: utf-8 -*-
+"""
+excel_tool.py —— Excel 读取、初筛过滤、初筛结果输出、项目类型选择
+
+功能：
+1. 读取投标机会清单 Excel（.xlsx），识别字段（多清单合并 + 表头行自动探测）；
+2. 初筛：公告 5 天内 + 公告类型合法 + 项目类型命中 + 与公司业务相关（同时满足）；
+3. 输出「初筛结果」Excel（{时间}_初筛结果.xlsx，各清单一个 sheet，放清单路径）；
+4. 项目类型：17 大类 + 84 子类模板为脚本内置常量（P3 起不随业务路径），用户每次选择的结果
+   写入「清单路径/项目类型选择.json」；
+5. 提供初筛汇总 markdown 表格生成函数（研判报告 md 用）。
+
+说明：
+- 仅支持 .xlsx；若检测到 .xls 或 .csv，给出中文提示"请另存为 .xlsx 格式后重试"。
+- 项目类型范围由「清单路径/项目类型选择.json」配置（用户在初筛前确认）；配置缺失或
+  无启用类型时自动跳过类型过滤。
+- 相关性为软标记：命中"相关"，未命中或资料不齐"待确认"，一律不剔除。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from datetime import datetime, timedelta
+
+import pandas as pd
+
+# 项目类型模板（固定在 Skill 内部：本文件常量 + SKILL.md 步骤 2 列表，不随业务路径）
+# 2026-08-05 重构：17 大类 + 细分子类 二级结构（83 个子类），已消除"其他"兜底类；
+#   未分类项目暂归大类"专业技术服务"并标记待确认（type_pending），由 AI 对话中人工确认。
+# 每次研判由 AI 展示大类让用户选择，再对每个大类选择子类（默认全部子类），结果写入清单路径/项目类型选择.json
+PROJECT_TYPES_TEMPLATE = [
+    {"名称": "教育培训与设备", "子类": [
+        {"名称": "教育信息化平台", "关键词": ["教育信息化", "智慧校园", "智慧教育", "多媒体教室", "数字化校园", "教育云平台", "在线教学", "智慧课堂", "智慧平板", "未来学校", "云课堂", "双师课堂", "同步课堂", "在线课堂", "数字教育", "教育大脑", "家校社", "县中崛起", "教学资源", "新型空间", "教育"]},
+        {"名称": "校园信息化设备", "关键词": ["多媒体", "一体机", "信息化设备", "电子类", "智慧体育", "智能批阅", "电子教室", "电子班牌", "教学硬件"]},
+        {"名称": "教学仪器与实验设备", "关键词": ["教学仪器", "教学设备", "实验设备", "实验室设备", "实验仪器", "实验室", "理化生", "专用教室", "功能教室", "实验功能室", "仪器设备"]},
+        {"名称": "实训与教具设备", "关键词": ["实训", "实训设备", "实训室", "实训基地", "创客中心", "虚拟仿真", "智慧黑板", "录播", "科创平台", "3D打印", "虚拟仿", "躺睡", "特教", "专业群", "课桌椅", "课桌", "教玩具", "玩具", "学具", "体育器材", "教学互联"]},
+        {"名称": "培训与人才服务", "关键词": ["培训", "人才", "休养", "研学", "师资", "继续教育", "培育", "培养", "研修", "轮训", "素质提升", "课程", "技能中心", "第一课"]},
+        {"名称": "教育后勤与校园设施", "关键词": ["接送", "托育", "宿舍楼"]},
+    ]},
+    {"名称": "医疗健康", "子类": [
+        {"名称": "医疗信息化系统", "关键词": ["医疗信息化", "智慧医疗", "医院信息系统", "HIS", "电子病历", "互联网医院", "输血", "DRGs", "病理", "智慧影像", "影像诊断", "医保", "质控", "临床试验", "导检", "手麻", "智慧科室", "智能采血", "医疗质量", "无纸化", "未来医院"]},
+        {"名称": "影像检查设备", "关键词": ["磁共振", "CT", "DSA", "X射线", "X光机", "C臂", "彩超", "B超", "DR", "超声", "骨密度", "影像设备", "内窥镜", "内镜", "腔镜", "胸腔镜", "腹腔镜", "关节镜", "椎间孔镜", "胃肠镜", "肠镜", "屈光", "眼底", "分析仪", "质谱", "化学发光", "图谱仪", "脑涨落", "心肺运动", "听觉", "钬激光", "直线加速器"]},
+        {"名称": "治疗与急救设备", "关键词": ["治疗机", "治疗仪", "监护仪", "呼吸机", "血透", "透析", "热疗", "胎心", "监护", "冲击波", "激光", "心肺复苏", "高压氧", "病床", "床单元", "注射泵", "输液泵", "治疗椅", "手术导航", "氧化电位水", "球管", "基因", "血样", "采血", "发药", "包药", "接管机", "存储舱", "纯水", "纯水仪", "供应室", "医疗器械", "医疗设备", "检验设备", "药敏", "生化分析", "免疫分析", "离子色谱", "病毒载量", "设备更新"]},
+        {"名称": "药品试剂与医用耗材", "关键词": ["医用耗材", "医用气体", "氧气", "液氧", "医用氧", "瓶装气体", "气体供应", "试剂", "药品", "特医食品", "配方食品", "营养制剂", "中药配方", "中药房", "饮片", "颗粒剂", "医疗专业化", "清洗液", "消毒剂", "消毒液"]},
+        {"名称": "医疗健康服务", "关键词": ["医疗", "体检", "康复", "心理", "理疗", "视力", "口腔", "门诊", "防疫", "接种", "病媒", "血站", "血液", "卫生", "义诊", "保健", "洗涤", "医废", "医疗废物", "被服", "陪护服务", "医养"]},
+        {"名称": "医共体与医院建设", "关键词": ["医共体"]},
+    ]},
+    {"名称": "政务与安防信息化", "子类": [
+        {"名称": "政务平台与数据服务", "关键词": ["政务信息化", "电子政务", "政务云", "数据中心", "政务服务平台", "一网通办", "网上办事", "数据服务", "数据资源", "数据管理", "城市大脑", "数智", "数字化", "数字化改革", "数字化提升", "监管平台", "治理平台", "智能监管", "一体化", "社会治理", "应用建设", "xc", "国产化", "信创"]},
+        {"名称": "数字乡村与基层治理", "关键词": ["数字乡村", "基层治理", "未来乡村", "共富", "数字档案馆", "智慧法庭", "数字法庭", "电子卷宗", "政务", "城管", "信息采集", "法院", "送达", "评查", "办案", "摸排", "勤务中台"]},
+        {"名称": "公安安防监控", "关键词": ["安防", "视频监控", "雪亮工程", "平安城市", "监控系统", "监控电路", "监控", "天网", "电子围栏", "治超", "执法仪", "警用", "勤务", "警务", "综治", "侦查", "护苗", "取证", "拖车", "共护"]},
+        {"名称": "智慧城市与社区", "关键词": ["智慧园区", "智慧社区", "门禁", "楼宇智能化", "未来社区", "智安校园", "智慧校园"]},
+    ]},
+    {"名称": "信息化与智能化", "子类": [
+        {"名称": "系统集成与弱电工程", "关键词": ["系统集成", "网络集成", "弱电工程", "弱电", "机房建设", "机房", "综合布线", "智能化", "集成项目", "物联网"]},
+        {"名称": "网络通信与平台", "关键词": ["通信", "宽带", "专线", "5G", "基站", "光纤", "网络基础", "网络升级", "信息基础", "平台", "数据中台", "汇聚平台", "交换机", "短信", "链路", "数据治理"]},
+        {"名称": "网络安全服务", "关键词": ["网络安全", "等保", "渗透测试", "安全服务", "密评", "商用密码", "密码改造", "数据安全", "网络防护", "态势感知", "终端安全"]},
+        {"名称": "运维服务", "关键词": ["运维", "IT外包", "设备维护", "驻场服务", "技术服务外包", "维保", "保养", "养护", "维修服务", "维护", "保修", "运行维护", "值守", "运行管理", "维护保障"]},
+        {"名称": "低空经济与人工智能", "关键词": ["低空", "无人机", "人工智能", "机器人", "AI", "卫星", "遥感", "智能装备"]},
+    ]},
+    {"名称": "办公设备与家具用品", "子类": [
+        {"名称": "计算机与显示设备", "关键词": ["办公设备", "计算机", "电脑", "工作站", "图形工作站", "服务器", "显示屏", "大屏", "LED", "固态硬盘", "存储设备", "投影仪", "音响", "广播", "一体机"]},
+        {"名称": "打印复印与耗材", "关键词": ["打印机", "复印机", "扫描仪", "办公耗材", "打印耗材", "复印耗材"]},
+        {"名称": "办公家具与用品", "关键词": ["办公家具", "家具", "桌椅", "座椅", "幕布", "柜子", "密集架", "讲台", "黑板", "文具", "办公用品"]},
+        {"名称": "宿舍与生活家具", "关键词": ["床铺", "宿舍床", "学生床", "储物柜", "窗帘", "钢琴", "学校家具", "日用品", "木制", "床上用品", "床品", "被褥"]},
+    ]},
+    {"名称": "家电机电设备", "子类": [
+        {"名称": "空调与暖通设备", "关键词": ["空调", "空气能", "热泵", "开水器", "直饮机"]},
+        {"名称": "家用电器", "关键词": ["电器", "电热水壶", "洗衣池", "家电"]},
+        {"名称": "机电与特种设备", "关键词": ["电梯", "发电机", "机电设备", "登机桥", "道面", "机场设施", "助航"]},
+    ]},
+    {"名称": "后勤物业与餐饮", "子类": [
+        {"名称": "物业服务", "关键词": ["物业", "物业化"]},
+        {"名称": "保洁与绿化养护", "关键词": ["保洁", "绿化养护", "绿化管养", "清扫", "消杀", "除四害"]},
+        {"名称": "房屋租赁与后勤管理", "关键词": ["租赁", "租用", "代管", "后勤", "宿管", "宿舍管理"]},
+        {"名称": "食堂与食材配送", "关键词": ["食堂", "食材", "粮油", "食品原材料", "营养餐", "膳食", "食品配送", "大米", "学生奶", "营养食品", "餐饮", "伙食", "餐具"]},
+        {"名称": "食堂劳务外包", "关键词": ["食堂劳务", "食堂外包", "餐饮劳务", "餐饮外包", "食堂经营", "食堂托管", "食堂用工", "食堂服务", "食堂人员"]},
+        {"名称": "厨房设备", "关键词": ["厨房"]},
+        {"名称": "劳务外包与派遣", "关键词": ["劳务", "派遣", "用工", "外包", "工勤", "陪护", "护工", "后勤服务外包", "社会化服务", "辅助", "教官", "打印输出", "准军事化"]},
+    ]},
+    {"名称": "安保消防与应急", "子类": [
+        {"名称": "安保与秩序维护", "关键词": ["保安", "安保", "秩序维护", "门卫", "巡逻", "安全保护", "安全管家"]},
+        {"名称": "消防工程与器材", "关键词": ["消防器材", "消防", "应消", "消控", "灭火器", "烟感", "烟雾", "封闭化", "防火"]},
+        {"名称": "应急与救援", "关键词": ["应急物资", "救灾物资", "防汛物资", "救援装备", "防护装备", "应急救援", "救援", "应急指挥", "应急广播", "防灾减灾", "避灾", "应急小单元", "提能升级", "应急胶囊", "水泵", "防暴", "升降柱", "防冲撞", "升降型", "应急装备", "巡查", "安全生产", "隐患排查", "安全检查"]},
+        {"名称": "服装与劳保物资", "关键词": ["服装", "被装", "制服", "工装", "劳保", "鞋帽", "劳保物资", "劳保器材", "防护器材", "被服"]},
+    ]},
+    {"名称": "工程建设与市政", "子类": [
+        {"名称": "土建施工", "关键词": ["施工", "建设工程", "土建工程", "迁建", "新建工程", "扩建", "改扩建", "加固", "修复", "改建", "微改造", "提升改造"]},
+        {"名称": "改造与修缮", "关键词": ["改造工程", "提升工程", "维修改造", "维修工程", "维修加固", "修缮", "翻新", "整治工程", "粉刷", "屋面", "防水", "功能性改造", "老旧小区", "老省心", "维修", "基础设施", "楼梯", "等候区", "疏堵", "疏导", "小三改", "站所", "治乱", "三改一拆", "拆违", "拆危", "拆临"]},
+        {"名称": "拆除与搬迁", "关键词": ["拆除", "搬迁"]},
+        {"名称": "建筑装饰", "关键词": ["建筑装饰", "装修工程", "装修", "装饰", "展厅", "布展", "展区", "地板", "门窗", "吊顶", "幕墙", "涂料", "墙面粉刷"]},
+        {"名称": "乡村建设", "关键词": ["和美乡村", "美丽宜居", "村貌", "古村"]},
+        {"名称": "市政工程", "关键词": ["市政工程", "市政", "道路", "公路", "桥隧", "桥梁", "隧道", "管网", "管材", "钢塑管", "路灯", "亮化", "信号灯", "候车亭", "护栏", "隔离带", "机非", "交调", "交通安全", "路面", "人行道", "集镇", "照明工程"]},
+        {"名称": "园林绿化", "关键词": ["园林绿化", "绿化修复", "景观", "鲜花", "花卉", "绿道", "公园", "广场", "公厕", "停车", "市容"]},
+    ]},
+    {"名称": "生态环保与能源", "子类": [
+        {"名称": "环境治理与监测", "关键词": ["环保", "环境监测", "环境质量", "环境整治", "环境健康", "综合整治", "五水共治", "水质", "污水", "黑臭水体", "污染", "废气", "土壤", "危险废物", "危废", "固废", "飞灰", "排污权", "排污口", "环评", "噪声", "藻类", "强降雨", "防控"]},
+        {"名称": "生态保护与低碳", "关键词": ["生态环境", "生态流量", "生态修复", "生态治理", "湿地", "生物多样性", "生态风险", "生态质量", "生态样地", "无害化", "绿色置换", "大气走航", "秸秆焚烧", "再生水", "宁静小区", "温室气体", "水生态", "碳达峰", "碳中和", "减污降碳", "低碳", "自然保护区", "自然保护", "无废城市", "无废"]},
+        {"名称": "地质与气象", "关键词": ["气象", "人工影响天气", "自动站", "测雨雷达", "雨量", "天气", "地质灾害", "地质", "矿产", "矿山", "勘查", "尾矿", "滑坡", "监测预警", "探测", "海洋预警", "风暴潮", "潮位", "海浪预报"]},
+        {"名称": "环卫与垃圾处理", "关键词": ["垃圾", "环卫", "转运", "垃圾分类", "粪便", "除臭", "废弃物"]},
+        {"名称": "电力与新能源", "关键词": ["电力", "供电", "用电", "通电", "配电", "光伏", "充电", "能源", "储能", "电费", "水电"]},
+        {"名称": "燃气与供热", "关键词": ["燃气", "供热", "供暖", "天然气"]},
+    ]},
+    {"名称": "农林牧渔与水利", "子类": [
+        {"名称": "粮食种植", "关键词": ["农业普查", "高标准农田", "农田", "水稻", "耕地", "农作物", "粮食", "土地复耕", "复垦", "复绿", "一张图", "耕林园草", "农事"]},
+        {"名称": "农资与植保", "关键词": ["种子", "化肥", "农药", "有机肥", "苗木", "果苗", "农资", "水肥", "秸秆", "黄龙病", "统防统治", "噻虫啉", "木虱", "免疫剂", "制种", "种业", "种质资源", "畲药", "药材"]},
+        {"名称": "特色农业", "关键词": ["茶", "油茶", "杨梅", "稻鱼", "鱼苗", "育苗"]},
+        {"名称": "林业生态", "关键词": ["林业", "森林", "古树", "防火", "护林", "林场", "松材线虫", "松材线", "疫木", "松树", "白蚁", "低效林", "阔叶", "良种", "落界", "定位站", "林地", "互花米草"]},
+        {"名称": "畜牧渔业", "关键词": ["渔业", "渔船", "渔政", "水生", "增殖放流", "养殖", "屠宰", "检疫"]},
+        {"名称": "水利水务", "关键词": ["水利工程", "水库", "排涝", "河道", "防汛", "灌溉", "山洪", "水文", "泵站", "供水", "水源地", "水源", "节水", "水效", "涉水", "水毁", "水旱", "雨污", "小水电", "河湖", "山塘", "灌区", "堤防", "河长", "滨水", "水旅", "用水"]},
+    ]},
+    {"名称": "专业技术服务", "子类": [
+        {"名称": "工程监理与咨询", "关键词": ["监理", "咨询", "技术服务", "第三方", "招标代理", "论证", "竣工验收", "建议书"]},
+        {"名称": "规划设计与造价", "关键词": ["设计", "规划", "规划编制", "详规", "方案编制", "造价", "预算编制", "可研", "可行性研究", "勘察", "研究", "评估", "调查", "普查", "实施方案", "协同创新"]},
+        {"名称": "检验检测与认证", "关键词": ["检测", "检验", "认证", "鉴定", "校准", "检定", "评审", "抽查", "监测", "抽检", "计量", "质检", "质量监测", "核查"]},
+        {"名称": "财务审计与税务", "关键词": ["财务", "审计", "会计", "资产评估", "决算", "协审", "税务", "绩效评价", "工伤预防", "责任险", "普查登记"]},
+        {"名称": "法律与档案服务", "关键词": ["法律", "调解", "仲裁", "信访", "公证", "诉讼", "档案", "档案数字化", "数字化加工", "翻拍", "卷宗", "知识产权", "商标", "专利"]},
+        {"名称": "保险与企业服务", "关键词": ["保险", "企业服务", "科技成果", "规范化管理", "中试", "代办"]},
+    ]},
+    {"名称": "文化体育与文旅", "子类": [
+        {"名称": "体育赛事", "关键词": ["赛事", "比赛", "竞赛", "锦标赛", "联赛", "巡回赛", "公开赛", "挑战赛", "邀请赛", "预选赛", "争霸赛", "赛区", "大赛", "系列赛", "运动会", "围棋", "轮滑", "桨板", "龙舟", "越野", "马拉松", "魔方", "精武"]},
+        {"名称": "文化活动与演出", "关键词": ["演出", "文艺", "歌王", "艺术节", "晚会", "典礼", "祭祀", "庙会", "电影", "文化惠民", "文明", "志愿", "送戏", "系列会", "生活周", "活动周", "文化交流", "党建", "校园文化", "村落", "文物", "峰会", "论坛", "大会", "博览会", "节庆", "推介会", "直播"]},
+        {"名称": "媒体与宣传推广", "关键词": ["媒体", "外宣", "宣传", "品牌推广", "品牌", "推广", "客源", "客源培育", "对接会", "语料库", "旅行社", "讲解", "创建服务", "融媒", "融媒体", "传播"]},
+        {"名称": "印刷与广告制作", "关键词": ["印刷", "广告", "展览", "会展", "图书", "教材", "作业本", "新闻纸", "期刊", "出版物", "教科书", "学生用书", "教辅", "标识", "标牌", "导视", "专题片", "短视频", "视频制作", "拍摄", "文创", "簿册", "书籍", "出版"]},
+        {"名称": "体育健身设施", "关键词": ["体育", "健身", "场馆", "游泳", "足球场", "篮球场", "跑道", "操场", "塑胶", "运动场", "羽毛球", "乒乓球", "气排球", "运动设备", "体质", "地垫", "训练场", "训练馆"]},
+        {"名称": "文旅与景区", "关键词": ["旅游", "酒店", "民宿", "景区", "文旅"]},
+        {"名称": "场馆运营", "关键词": ["运营", "托管", "科技大市场", "双创", "产业园", "活动中心", "科技馆", "青少年宫", "展馆", "品牌赋能", "文化站", "文化中心", "群文", "共创", "会议服务", "科普馆"]},
+    ]},
+    {"名称": "车辆船艇与运输", "子类": [
+        {"名称": "公务与执法车辆", "关键词": ["车辆", "公务用车", "公务出行", "执法执勤", "指挥车", "特种用车", "专业技术用车", "通勤车", "租车", "网约车", "校车"]},
+        {"名称": "专用车辆", "关键词": ["救护车", "消防车"]},
+        {"名称": "船艇采购", "关键词": ["执法船", "船舶", "船艇", "执法艇", "巡逻艇", "公务艇", "渡船", "执法小艇"]},
+        {"名称": "运输物流服务", "关键词": ["运输服务", "物流", "快递", "搬运", "装卸", "加油", "燃油", "柴油", "加油服务"]},
+    ]},
+    {"名称": "土地测绘与自然资源", "子类": [
+        {"名称": "土地与不动产", "关键词": ["土地", "不动产", "用地", "农转用", "报批", "地籍", "基准地价", "自然资源", "国土", "滩涂", "潮间带"]},
+        {"名称": "测绘测量", "关键词": ["测绘", "测量", "勘测定界"]},
+        {"名称": "遥感与地理信息", "关键词": ["遥感", "地理信息", "时空", "地理国情", "影像", "建模"]},
+    ]},
+    {"名称": "民政福利与养老", "子类": [
+        {"名称": "养老服务", "关键词": ["养老", "医养", "善居"]},
+        {"名称": "福利与救助", "关键词": ["福利", "救助", "慈善", "帮扶", "退役军人", "残疾人", "孤儿", "困难群众"]},
+        {"名称": "民政服务", "关键词": ["民政", "民生"]},
+        {"名称": "殡葬服务", "关键词": ["殡葬", "公墓", "殡仪", "火化", "墓"]},
+    ]},
+    {"名称": "电子卖场类", "子类": [
+        {"名称": "电子卖场公告", "关键词": ["电子卖场"]},
+        {"名称": "竞价与意向公告", "关键词": ["采购意向", "竞价", "报废", "公开征集", "反拍"]},
+    ]},
+]
+
+# 旧 18 类名称 → 新 17 大类映射（P3.1 修复：旧格式 项目类型选择.json 兼容，
+# 旧类名映射到新大类后走正常大类校验；无法映射的名称（如"其他"）给出中文警告，不静默丢弃）
+OLD_TYPE_NAME_MAP = {
+    "教育信息化": "教育培训与设备",
+    "教学仪器设备": "教育培训与设备",
+    "办公设备": "办公设备与家具用品",
+    "家具办公用品": "办公设备与家具用品",
+    "医疗信息化": "医疗健康",
+    "医疗器械": "医疗健康",
+    "政务信息化": "政务与安防信息化",
+    "智慧园区社区": "政务与安防信息化",
+    "智慧园区/社区": "政务与安防信息化",
+    "公安安防信息化": "政务与安防信息化",
+    "系统集成": "信息化与智能化",
+    "运维服务": "信息化与智能化",
+    "网络安全服务": "信息化与智能化",
+    "家电机电设备": "家电机电设备",
+    "印刷广告服务": "文化体育与文旅",
+    "建筑装饰工程": "工程建设与市政",
+    "市政园林工程": "工程建设与市政",
+    "电子卖场类": "电子卖场类",
+}
+
+# 行业域兜底匹配（采购人关键词 + 项目名行业词双重信号，避免把"学校食堂/医院物业"误判为行业类型）
+# 用途：项目名未命中任何关键词时，若采购人属于某行业且项目名含该行业词，归入对应行业类型
+# 注意：为列表结构（同类型可多条规则）；政务类仅用 IT 词，公安/政法类可用服务/设备/建设等宽词
+SECTOR_BUYER_KWS = [
+    # 教育域：采购人为学校/教育局等 → 无条件追加"教育培训与设备"（教育相关项目都应带教育标签），不要求行业词
+    ("教育培训与设备",
+        ["教育局", "教育", "学校", "中学", "小学", "幼儿园", "学院", "职教", "托育", "学区", "校园", "学生"],
+        []),
+    ("医疗健康",
+        ["医院", "卫生院", "医共体", "疾控", "卫生健康", "医疗", "人民医院"],
+        ["信息化", "智能化", "数字化", "系统", "平台", "软件", "智能", "智慧", "电子", "网络", "设备", "仪器", "耗材", "试剂", "器材", "设备采购"]),
+    ("政务与安防信息化",
+        ["公安", "派出所", "交警", "警务", "政法", "安防", "法院", "检察院"],
+        ["信息化", "智能化", "数字化", "系统", "平台", "软件", "智能", "智慧", "监控", "电子", "勤务", "天网", "应用", "数据", "监管", "治理", "服务", "设备", "建设", "管理"]),
+    ("政务与安防信息化",
+        ["局", "委", "办", "政府", "中心", "街道", "乡镇", "管委会", "管理委员会"],
+        ["信息化", "智能化", "数字化", "系统", "平台", "软件", "智能", "智慧", "数据", "应用", "电子", "监管", "治理"]),
+    # 文旅域：采购人为文旅/宣传主管部门 → 无条件追加"文化体育与文旅"（宣传文化类项目都应带文旅标签）
+    ("文化体育与文旅",
+        ["文化和广电旅游体育局", "文广旅体", "文化旅游局", "文化和旅游局", "文广局", "宣传部", "文广旅体局", "文广旅游局"],
+        []),
+    # 生态环保域：采购人为生态环境主管部门且项目名含环保行业词
+    ("生态环保与能源",
+        ["生态环境局", "环保局", "生态环境保护", "环境局"],
+        ["环保", "生态", "污染", "废水", "废气", "固废", "危废", "垃圾", "无废", "排放", "环境", "监测", "评价", "治理", "整治"]),
+    # 自然资源域：采购人为自然资源/规划主管部门且项目名含资源调查评价类词
+    ("土地测绘与自然资源",
+        ["自然资源和规划局", "自然资源局", "规划局", "国土资源", "资源管理局"],
+        ["测绘", "测量", "评价", "调查", "普查", "资源", "土地", "不动产", "地籍", "海域", "滩涂", "预警", "开发利用"]),
+]
+
+# 项目类型选择结果文件名（写在清单路径下）
+PROJECT_TYPES_SELECTION_FILE = "项目类型选择.json"
+
+# 时间范围选择结果文件名（写在清单路径下；每次初筛可不同，未配置/不限时不强制限定）
+TIME_RANGE_FILE = "时间范围选择.json"
+
+# 合法公告类型（需求确认）
+VALID_ANNOUNCE_TYPES = ("采购项目公告", "电子卖场公告")
+
+# 需求字段清单
+REQUIRED_COLUMNS = [
+    "公告时间",
+    "公告类型",
+    "采购项目名称",
+]
+
+# 常用字段全名（用于判断列是否存在）
+ALL_COLUMNS = [
+    "公告时间",
+    "公告类型",
+    "所在区县",
+    "采购人",
+    "采购项目名称",
+    "预算金额(元)",
+    "中标金额(元)",
+    "中标单位",
+    "代理机构",
+    "地址链接URL",
+]
+
+
+class ExcelToolError(Exception):
+    """Excel 处理过程中的中文可读异常。"""
+
+
+def check_format_supported(path: str) -> str:
+    """检查文件格式，返回扩展名或抛出中文提示。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsx":
+        return ext
+    if ext in (".xls", ".xlsm", ".csv"):
+        raise ExcelToolError(
+            "检测到文件格式为「%s」。请先在 Excel 中打开该文件，"
+            "点击「文件 → 另存为 → Excel 工作簿(.xlsx)」保存后，再放回清单路径重试。" % ext
+        )
+    raise ExcelToolError("无法识别的文件格式「%s」，请提供 .xlsx 格式的投标机会清单。" % ext)
+
+
+def _parse_date(value):
+    """将公告时间解析为 datetime，兼容多种格式。"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, (int, float)):
+        # 可能是 Excel 序列日期
+        try:
+            return pd.Timestamp(value).to_pydatetime()
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # 常见中文日期格式
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%Y年%m月%d日",
+        "%Y/%m/%d %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    # 兜底：用 pandas 解析
+    try:
+        return pd.to_datetime(text).to_pydatetime()
+    except Exception:
+        return None
+
+
+def load_excel(path: str) -> pd.DataFrame:
+    """读取 Excel 清单，返回 DataFrame。"""
+    if not os.path.exists(path):
+        raise ExcelToolError("未找到投标机会清单文件：%s\n请确认清单路径下存在 .xlsx 清单文件。" % path)
+
+    check_format_supported(path)
+
+    try:
+        df = pd.read_excel(path, dtype=str)
+    except Exception as e:
+        raise ExcelToolError("读取 Excel 失败，请确认文件未被占用且格式正确。详细信息：%s" % e)
+
+    if df.empty:
+        raise ExcelToolError("Excel 文件为空，没有可处理的投标机会数据。")
+
+    # 检查必需列
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ExcelToolError(
+            "Excel 缺少以下必需列：%s。\n请确认清单包含：公告时间、公告类型、采购项目名称等列。"
+            % "、".join(missing)
+        )
+    return df
+
+
+def _detect_header_row(path: str, max_scan: int = 5) -> int:
+    """探测表头行：扫描前 max_scan 行，找到含「采购项目名称」的行（1 起）。找不到返回 1。"""
+    try:
+        head = pd.read_excel(path, header=None, nrows=max_scan, dtype=str)
+    except Exception:
+        return 1
+    for i in range(len(head)):
+        row_vals = [str(v) for v in head.iloc[i].tolist() if str(v) and str(v) != "nan"]
+        if any("采购项目名称" in v for v in row_vals):
+            return i + 1
+    return 1
+
+
+def load_excels_from_dir(list_dir: str) -> dict:
+    """
+    扫描清单路径下全部 .xlsx 清单并合并（自动探测各文件表头行）。
+
+    多 Sheet 主文件支持（用户单文件工作流：政府采购公告.xlsx 不同地区不同 Sheet）：
+    - 文件含多个 Sheet 时逐 Sheet 读取，来源标记为「文件名::Sheet名」；
+    - 每个 Sheet 独立探测表头行、独立校验必需列；单个 Sheet 失败不阻塞其他 Sheet。
+
+    返回 {"df": 合并DataFrame(含"来源文件""原始行号"列), "sources": {来源名: 绝对路径},
+          "header_rows": {来源名: 表头行号}, "errors": [个别文件的中文错误]}
+    - 表头不在第 1 行的文件（如丽水表头在第 3 行）自动适配；
+    - 单个文件缺必需列或读取失败：记入 errors，不阻塞其他文件；
+    - 全部文件失败或无 .xlsx 时抛出 ExcelToolError（含 .xls/.csv 转换提示）。
+    """
+    if not os.path.isdir(list_dir):
+        raise ExcelToolError("未找到清单路径：%s\n请确认该文件夹存在（放置投标机会清单 Excel 的文件夹）。" % list_dir)
+    files = sorted(
+        f for f in os.listdir(list_dir)
+        if f.lower().endswith(".xlsx") and not f.startswith(("~$", "."))
+        # 排除本工具输出文件（初筛结果/历史研判结果），避免被当作来源清单重复扫描
+        and "初筛结果" not in f and "研判结果" not in f
+        # 排除采集器高亮版输出文件（{地市}政府采购公告_高亮版.xlsx），防止被当清单读入
+        and "高亮版" not in f
+    )
+    if not files:
+        other_formats = [
+            f for f in os.listdir(list_dir)
+            if f.lower().endswith((".xls", ".csv")) and not f.startswith(("~$", "."))
+        ]
+        if other_formats:
+            raise ExcelToolError(
+                "检测到文件「%s」格式不支持，本工具仅支持 .xlsx 格式。\n"
+                "请先在 Excel 中打开该文件，点击「文件 → 另存为 → Excel 工作簿(.xlsx)」保存后，再放回清单路径重试。"
+                % "、".join(other_formats)
+            )
+        raise ExcelToolError(
+            "清单路径下未找到 .xlsx 投标机会清单（路径：%s）。\n请将政府采购云平台导出的清单文件放入该文件夹后重试。"
+            % list_dir
+        )
+
+    frames, sources, header_rows, errors = [], {}, {}, []
+    for fname in files:
+        path = os.path.join(list_dir, fname)
+        header_row = _detect_header_row(path)
+        try:
+            df = pd.read_excel(path, dtype=str)
+        except Exception as e:
+            errors.append("读取「%s」失败：%s" % (fname, e))
+            continue
+        if df.empty:
+            errors.append("「%s」没有数据行，已跳过。" % fname)
+            continue
+        # 多 Sheet 主文件（不同地区不同 Sheet）：逐 Sheet 读取
+        if len(pd.ExcelFile(path).sheet_names) > 1:
+            try:
+                sheet_frames = _load_multi_sheet(path, fname, errors)
+            except Exception as e:
+                errors.append("读取「%s」多 Sheet 失败：%s" % (fname, e))
+                sheet_frames = []
+            for sf in sheet_frames:
+                frames.append(sf["df"])
+                sources[sf["source"]] = path
+                header_rows[sf["source"]] = sf["header_row"]
+            continue
+        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            errors.append("「%s」缺少必需列：%s（请确认含公告时间、公告类型、采购项目名称等列）。" % (fname, "、".join(missing)))
+            continue
+        df["来源文件"] = fname
+        df["原始行号"] = [header_row + 1 + i for i in range(len(df))]
+        frames.append(df)
+        sources[fname] = path
+        header_rows[fname] = header_row
+
+    if not frames:
+        raise ExcelToolError("没有可处理的投标机会清单文件。\n" + "\n".join(errors))
+
+    merged = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+    return {"df": merged, "sources": sources, "header_rows": header_rows, "errors": errors}
+
+
+def _load_multi_sheet(path: str, fname: str, errors: list) -> list:
+    """
+    逐 Sheet 读取多 Sheet 主文件（政府采购公告.xlsx 等，不同地区不同 Sheet）。
+    返回 [{"df": DataFrame, "source": "文件名::Sheet名", "header_row": 行号}]；
+    单个 Sheet 缺必需列或空时记入 errors 并跳过（不阻塞其他 Sheet）。
+    """
+    import pandas as pd
+    out = []
+    try:
+        xls = pd.ExcelFile(path)
+        sheet_names = xls.sheet_names
+    except Exception as e:
+        errors.append("读取「%s」工作表列表失败：%s" % (fname, e))
+        return out
+    for sn in sheet_names:
+        try:
+            head = pd.read_excel(path, sheet_name=sn, header=None, nrows=5, dtype=str)
+        except Exception:
+            continue
+        header_row = 1
+        for i in range(len(head)):
+            row_vals = [str(v) for v in head.iloc[i].tolist() if str(v) and str(v) != "nan"]
+            if any("采购项目名称" in v for v in row_vals):
+                header_row = i + 1
+                break
+        try:
+            df = pd.read_excel(path, sheet_name=sn, header=header_row - 1, dtype=str)
+        except Exception as e:
+            errors.append("读取「%s」Sheet「%s」失败：%s" % (fname, sn, e))
+            continue
+        if df.empty:
+            errors.append("「%s」Sheet「%s」没有数据行，已跳过。" % (fname, sn))
+            continue
+        missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            errors.append(
+                "「%s」Sheet「%s」缺少必需列：%s（请确认含公告时间、公告类型、采购项目名称等列）。"
+                % (fname, sn, "、".join(missing))
+            )
+            continue
+        source = "%s::%s" % (fname, sn)
+        df["来源文件"] = source
+        df["原始行号"] = [header_row + 1 + i for i in range(len(df))]
+        out.append({"df": df, "source": source, "header_row": header_row})
+    return out
+
+
+def _parse_types_file(path: str, errors: list = None) -> list:
+    """解析项目类型选择文件，返回选中的大类范围列表 [{"名称": 大类, "子类": [名称...] 或 None(全部)}]。
+
+    兼容三种格式：
+    - 新格式：{"scope": [{"大类": "...", "子类": [...]}]} 或 [{"大类": "...", "子类": [...]}]；
+    - 旧格式：{"types": ["大类名"...]} / 纯名称列表 / {"selected": [...]} —— 视为所选大类全部子类；
+      旧格式名称自动映射到新 17 大类（见 OLD_TYPE_NAME_MAP），无法映射的名称（如"其他"）
+      记入 errors 中文警告（不静默丢弃）；新格式（scope 列表）行为不变。
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    template_names = {t["名称"] for t in PROJECT_TYPES_TEMPLATE}
+
+    def resolve(name: str):
+        """旧格式名称 → 新大类名称；已在新模板中则原样返回；无法识别返回 None。"""
+        if name in template_names:
+            return name
+        return OLD_TYPE_NAME_MAP.get(name)
+
+    def warn_unknown(names: list) -> None:
+        unknown = sorted({str(n) for n in names if str(n).strip() and resolve(str(n).strip()) is None})
+        if unknown and errors is not None:
+            for n in unknown:
+                errors.append(
+                    "旧配置（%s）中存在无法识别的类型：%s，请重新选择项目类型"
+                    "（建议先在对话中重新确认项目类型，本次初筛将跳过该类型）。"
+                    % (PROJECT_TYPES_SELECTION_FILE, n)
+                )
+
+    entries = []
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        if isinstance(data.get("scope"), list):
+            entries = data["scope"]
+        elif isinstance(data.get("types"), list):
+            names = [str(t) if isinstance(t, str) else str(t.get("名称", "")) for t in data["types"] if t]
+            warn_unknown(names)
+            return [{"名称": n, "子类": None} for n in (resolve(x) for x in names) if n]
+        elif isinstance(data.get("selected"), list):
+            names = [str(n) for n in data["selected"] if str(n).strip()]
+            warn_unknown(names)
+            return [{"名称": n, "子类": None} for n in (resolve(x) for x in names) if n]
+    scope = []
+    for e in entries:
+        if isinstance(e, str):
+            # 纯名称列表为旧格式：旧名称映射到新大类，无法识别记中文警告
+            n = resolve(e)
+            if n:
+                scope.append({"名称": n, "子类": None})
+            else:
+                warn_unknown([e])
+        elif isinstance(e, dict):
+            big = str(e.get("大类") or e.get("名称") or "").strip()
+            subs = e.get("子类")
+            if big:
+                if isinstance(subs, list):
+                    sub_names = [str(s) for s in subs if str(s).strip()]
+                    scope.append({"名称": big, "子类": sub_names or None})
+                else:
+                    scope.append({"名称": big, "子类": None})
+    return scope
+
+
+def _all_subclass_names(big_name: str) -> list:
+    """返回大类下全部子类名称（按模板顺序）。"""
+    for t in PROJECT_TYPES_TEMPLATE:
+        if t["名称"] == big_name:
+            return [s["名称"] for s in t.get("子类", [])]
+    return []
+
+
+def load_project_types(path: str = None, errors: list = None) -> list:
+    """
+    读取用户本次确认的项目类型范围（清单路径/项目类型选择.json），仅返回启用的大类。
+
+    选择文件记录用户选中的大类及子类（P3：模板固定在内置常量，不随业务路径）：
+    [{"大类": "医疗健康", "子类": ["影像检查设备"]}]，子类缺省/空数组 = 该大类全部子类。
+    返回 [{"名称": 大类, "子类": [名称...] 或 None(全部)}]；
+    配置不存在、格式错误或无启用类型时返回 []（初筛将跳过类型过滤）。
+
+    P3.1：旧格式名称（{"types": [...]}/纯名称列表/{"selected": [...]}）自动映射到新 17 大类
+    （见 OLD_TYPE_NAME_MAP）；无法映射的名称（如"其他"）不静默丢弃，记入 errors（中文警告，
+    含解决建议），由调用方输出给用户。
+    """
+    if not path or not os.path.exists(path):
+        return []
+    scope = _parse_types_file(path, errors=errors)
+    template_names = {t["名称"] for t in PROJECT_TYPES_TEMPLATE}
+    enabled = []
+    for item in scope:
+        if item["名称"] not in template_names:
+            continue
+        subs = item.get("子类")
+        if subs:
+            valid = [s for s in subs if s in set(_all_subclass_names(item["名称"]))]
+            # 同类重复出现时合并子类（旧格式多旧名映射到同一大类时保证只生效一次）
+            if valid:
+                for prev in enabled:
+                    if prev["名称"] == item["名称"]:
+                        prev["子类"] = sorted(set(prev.get("子类") or []) | set(valid))
+                        break
+                else:
+                    enabled.append({"名称": item["名称"], "子类": valid})
+                continue
+            subs = None
+        for prev in enabled:
+            if prev["名称"] == item["名称"]:
+                break
+        else:
+            enabled.append({"名称": item["名称"], "子类": subs})
+    return enabled
+
+
+def list_all_project_types(path: str = None) -> list:
+    """
+    列出全部项目类型（大类+子类），供对话展示给用户。
+
+    path 为清单路径/项目类型选择.json：存在时返回模板并标记其中已选大类启用状态；
+    不存在时返回内置模板（全部未启用）。返回 [{"名称", "子类": [...], "启用"}]。
+    """
+    enabled_bigs = {item["名称"] for item in load_project_types(path)} if path else set()
+    return [
+        {"名称": t["名称"], "子类": [s["名称"] for s in t.get("子类", [])], "启用": t["名称"] in enabled_bigs}
+        for t in PROJECT_TYPES_TEMPLATE
+    ]
+
+
+def save_selected_types(scope, path: str = None) -> str:
+    """
+    将用户本次选择的项目类型范围写入「清单路径/项目类型选择.json」（P3 起）。
+
+    支持两种入参：
+    - 二级结构（推荐）：scope = {"教育培训与设备": ["教育信息化"], "医疗健康": []}，
+      值为空数组或 None 表示该大类全部子类；
+    - 兼容旧格式：scope = ["教育培训与设备", "医疗健康"]（仅大类，全部子类）。
+
+    文件内容：{"scope": [{"大类": "...", "子类": [...]}]}，可直接用记事本增删。
+    """
+    if not path:
+        raise ExcelToolError(
+            "无法保存项目类型选择：未提供输出路径。\n"
+            "请传入清单路径下的文件路径，如 os.path.join(清单路径, '项目类型选择.json')。"
+        )
+    template_names = [t["名称"] for t in PROJECT_TYPES_TEMPLATE]
+    scope_list = []
+    if isinstance(scope, dict):
+        for big in template_names:
+            if big in scope:
+                subs = scope[big]
+                if isinstance(subs, list) and subs:
+                    scope_list.append({"大类": big, "子类": [str(s) for s in subs]})
+                else:
+                    scope_list.append({"大类": big, "子类": []})
+    elif isinstance(scope, (list, tuple)):
+        for big in template_names:
+            if big in set(str(s) for s in scope):
+                scope_list.append({"大类": big, "子类": []})
+    cfg = {
+        "说明": "本次研判选择的项目类型范围（大类+子类，空数组=该大类全部子类；由 AI 在对话中确认后写入，每次研判可不同；可直接用记事本增删）。",
+        "scope": scope_list,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise ExcelToolError("保存项目类型选择文件失败（%s）：%s" % (path, e))
+    return path
+
+
+def save_time_range(days, path: str = None) -> str:
+    """
+    将用户本次选择的时间范围写入「清单路径/时间范围选择.json」。
+
+    days 为天数（如 5/7/15/30/90）；传 None/0/"不限"/"全部" 表示不限制公告时间（不做强制限定）。
+    文件内容：{"days": 5} 或 {"days": null}（null = 不限）。
+    """
+    if not path:
+        raise ExcelToolError(
+            "无法保存时间范围选择：未提供输出路径。\n"
+            "请传入清单路径下的文件路径，如 os.path.join(清单路径, '时间范围选择.json')。"
+        )
+    if days in (None, 0, "不限", "全部", "不限制"):
+        value = None
+    else:
+        try:
+            value = int(days)
+        except (TypeError, ValueError):
+            value = None
+    cfg = {
+        "说明": "本次研判选择的公告时间范围（天）；null 表示不限制公告时间。由 AI 在对话中确认后写入，每次研判可不同；可直接用记事本修改。",
+        "days": value,
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        raise ExcelToolError("保存时间范围选择文件失败（%s）：%s" % (path, e))
+    return path
+
+
+def load_time_range(path: str = None):
+    """读取时间范围选择文件，返回天数（int）；未配置/格式错误/不限 时返回 None（不限时间）。"""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    days = data.get("days") if isinstance(data, dict) else None
+    if days in (None, 0, "", "不限", "全部", "不限制"):
+        return None
+    try:
+        return int(days)
+    except (TypeError, ValueError):
+        return None
+
+
+def _has_filled_content(company_text: str) -> bool:
+    """判断公司介绍是否已填写实际内容：任意一行冒号后有非空内容视为已填写。"""
+    if not company_text:
+        return False
+    for line in company_text.splitlines():
+        if "：" in line:
+            _, _, tail = line.partition("：")
+        elif ":" in line:
+            _, _, tail = line.partition(":")
+        else:
+            continue
+        if tail.strip():
+            return True
+    return False
+
+
+def extract_company_keywords(company_text: str) -> list:
+    """从公司介绍文本中抽取业务/产品相关关键词（2 字及以上中文词），用于相关性初判。"""
+    if not company_text:
+        return []
+    # 剔除模板引导说明行（> 开头的 blockquote），避免空模板被误判为公司业务内容
+    lines = [ln for ln in company_text.splitlines() if not ln.lstrip().startswith(">")]
+    company_text = "\n".join(lines)
+    # 去除非中文字符和常见停用词
+    text = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]+", " ", company_text)
+    stopwords = {
+        "我们", "公司", "有限公司", "本司", "企业", "业务", "产品", "服务",
+        "以及", "以及的", "以及公司", "主要", "提供", "包括", "拥有", "具备",
+        "相关", "各项", "以及本", "以及主", "以下", "如下", "相应", "领域",
+    }
+    words = set()
+    # 中文双字词
+    for m in re.findall(r"[\u4e00-\u9fa5]{2,8}", text):
+        w = m.strip()
+        if w and w not in stopwords and len(w) >= 2:
+            words.add(w)
+    # 英文/数字词
+    for m in re.findall(r"[a-zA-Z0-9]{2,}", text):
+        words.add(m.lower())
+    return sorted(words)
+
+
+def _stringify(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in ("nan", "none", "null"):
+        return ""
+    return text
+
+
+def classify_project(name: str, buyer: str = "", announce_type: str = "") -> dict:
+    """
+    按 17 大类 × 84 子类关键词体系对单个项目/业绩名称分类（初筛与业绩表共用）。
+
+    - 关键词匹配（项目名命中子类关键词）→ 行业域兜底（采购人+行业词）→ 电子卖场公告规则；
+    - 专属子类互斥：命中"食堂劳务外包"时不再标记"食堂与食材配送/劳务外包与派遣"；
+    - 全部未命中 → 暂归"专业技术服务"（pending=True，AI 人工确认）。
+
+    返回 {"pairs": [(大类, 子类)...], "display": "大类（子类）…", "pending": bool}
+    """
+    proj = _stringify(name)
+    buyer = _stringify(buyer)
+    atype = _stringify(announce_type)
+    matched_pairs = []
+    hit_kws = {}
+    for big in PROJECT_TYPES_TEMPLATE:
+        for sub in big.get("子类", []):
+            kws = [k for k in sub["关键词"] if k in proj]
+            if kws:
+                matched_pairs.append((big["名称"], sub["名称"]))
+                hit_kws[(big["名称"], sub["名称"])] = kws
+    # 专属子类互斥：命中"食堂劳务外包"时，不再重复标记"食堂与食材配送""劳务外包与派遣"
+    if any(b == "后勤物业与餐饮" and s == "食堂劳务外包" for b, s in matched_pairs):
+        matched_pairs = [
+            (b, s) for b, s in matched_pairs
+            if not (b == "后勤物业与餐饮" and s in ("食堂与食材配送", "劳务外包与派遣"))
+        ]
+    # 电子卖场公告 → 电子卖场类（公告类型为"电子卖场公告"即归入，不受项目名限制）
+    if atype == "电子卖场公告" and not any(b == "电子卖场类" for b, _ in matched_pairs):
+        matched_pairs.append(("电子卖场类", "电子卖场类"))
+    # 行业域兜底：采购人属某行业（行业词为空=该行业不限制，如教育域全部挂教育标签）→ 归入对应行业大类
+    for type_name, buyer_kws, it_kws in SECTOR_BUYER_KWS:
+        if not any(b == type_name for b, _ in matched_pairs) and any(k in buyer for k in buyer_kws) and (not it_kws or any(k in proj for k in it_kws)):
+            matched_pairs.append((type_name, type_name))
+    pending = not matched_pairs
+    if pending:
+        matched_pairs = [("专业技术服务", "专业技术服务")]
+    grouped = {}
+    for big, sub in matched_pairs:
+        grouped.setdefault(big, []).append(sub)
+    display_parts = []
+    for big, subs in grouped.items():
+        if len(subs) == 1 and subs[0] == big:
+            display_parts.append(big)
+        elif len(subs) == 1:
+            display_parts.append("%s（%s）" % (big, subs[0]))
+        else:
+            display_parts.append("%s（%s）" % (big, "、".join(subs)))
+    return {"pairs": matched_pairs, "display": "、".join(display_parts), "pending": pending, "hits": hit_kws}
+
+
+def filter_screening(
+    df: pd.DataFrame,
+    company_text: str = "",
+    days: int = None,
+    today: datetime = None,
+    project_types: list = None,
+) -> pd.DataFrame:
+    """
+    初筛：时间范围（可选，不强制）+ 公告类型合法 + 项目类型命中。
+
+    days 为 None/0 时不做时间过滤（不限公告时间，全部按"时间通过"处理）；
+    否则仅保留公告时间在 days 天以内的项目。
+
+    返回 DataFrame，新增列：
+    - 项目类型: 命中的已选项目类型名称（未命中为空）
+    - 初筛结果: 通过 / 时间不符 / 类型不符 / 项目类型不符 / 时间缺失
+    - 初筛原因: 各过滤项的明确原因（如"公告超过 N 天""不在已选项目类型范围"），通过项为"通过"
+    - 相关性初判: 相关 / 待确认（软标记，不参与过滤，仅作研判提示）
+    - 相关性依据: 命中的公司关键词，或未命中的说明
+
+    相关性为软标记：不命中也不剔除（避免因关键词覆盖不全误杀项目），
+    由 AI 在对话中向用户确认后决定是否研判。
+
+    project_types 为用户确认的启用类型列表（见 load_project_types）；
+    为 None 时自动读取清单路径/项目类型选择.json；无启用类型时跳过类型过滤。
+    """
+    if today is None:
+        today = datetime.now()
+    # days 为 None/0 = 不限制时间（不做时间过滤，全部按时间通过）
+    cutoff = None if not days else today - timedelta(days=days)
+
+    if project_types is None:
+        project_types = load_project_types()
+
+    company_keywords = extract_company_keywords(company_text)
+    has_company_data = _has_filled_content(company_text)
+
+    df = df.copy()
+    results = []
+    rel = []
+    rel_why = []
+    matched_type_names = []
+    type_pending_flags = []
+
+    for _, row in df.iterrows():
+        # 1) 时间条件（不限制时跳过；限制时公告时间缺失仍标记"时间缺失"）
+        if cutoff is None:
+            results.append("时间通过")
+        else:
+            dt = _parse_date(row.get("公告时间"))
+            if dt is None:
+                results.append("时间缺失")
+            else:
+                # 时间比较统一到日期
+                if dt.timestamp() >= cutoff.timestamp():
+                    results.append("时间通过")
+                else:
+                    results.append("时间不符")
+
+        # 2) 类型条件
+        atype = _stringify(row.get("公告类型"))
+        if atype in VALID_ANNOUNCE_TYPES:
+            type_ok = True
+        else:
+            type_ok = False
+            if results[-1] == "时间通过":
+                results[-1] = "类型不符"
+
+        # 3) 项目类型过滤（按清单路径/项目类型选择.json 中用户本次确认的大类+子类范围）
+        #    项目类型标注用全量模板（17 大类 × 子类）关键词匹配（未选中的类型也标注），过滤只用已选范围
+        proj = _stringify(row.get("采购项目名称"))
+        buyer = _stringify(row.get("采购人"))
+        atype = _stringify(row.get("公告类型"))
+        cls = classify_project(proj, buyer=buyer, announce_type=atype)
+        matched_pairs = cls["pairs"]
+        type_pending_flag = cls["pending"]
+        # 过滤：是否命中用户本次选择的大类+子类范围（子类为空数组=大类全部子类）
+        if project_types and results[-1] == "时间通过" and type_ok:
+            allowed = set()
+            for item in project_types:
+                subs = item.get("子类")
+                if subs is None:
+                    allowed.add((item["名称"], None))  # 大类级：命中该大类任意子类均可
+                else:
+                    allowed.update((item["名称"], s) for s in subs)
+            hit_selected = False
+            for big, sub in matched_pairs:
+                if (big, None) in allowed or (big, sub) in allowed:
+                    hit_selected = True
+                    break
+            if not hit_selected:
+                # 未分类项目不剔除：保留并标记"类型待确认"，由 AI 在对话中列出人工确认，
+                # 防止未分类项目在初筛时被静默遗漏（与相关性"待确认"同口径）
+                if type_pending_flag:
+                    results[-1] = "类型待确认"
+                else:
+                    results[-1] = "项目类型不符"
+        matched_type_names.append(cls["display"])
+        type_pending_flags.append(type_pending_flag)
+
+        # 4) 相关性初判（软标记：命中"相关"；未命中或资料不齐"待确认"，不剔除）
+        if has_company_data and company_keywords and proj:
+            hits = [k for k in company_keywords if k in proj]
+            if hits:
+                rel.append("相关")
+                rel_why.append("命中词：" + "、".join(sorted(hits)))
+            else:
+                rel.append("待确认")
+                rel_why.append("无公司关键词命中（关键词：" + "、".join(company_keywords[:12]) + "…）")
+        else:
+            rel.append("待确认")
+            rel_why.append("企业资料未填写完整，暂无法初判")
+
+    df["项目类型"] = matched_type_names
+    df["相关性初判"] = rel
+    df["相关性依据"] = rel_why
+
+    # 综合判定：时间+类型+项目类型 三项同时通过才进入候选清单
+    # 相关性不参与过滤，仅作软标记；未分类项目不剔除（类型待确认，由 AI 人工确认）
+    def decide(r):
+        if r == "时间不符":
+            return "时间不符", "公告超过 5 天"
+        if r == "类型不符":
+            return "类型不符", "公告类型不符"
+        if r == "时间缺失":
+            return "时间缺失", "公告时间缺失"
+        if r == "类型待确认":
+            return "通过", "项目类型未分类（暂归专业技术服务），待人工确认"
+        if r == "项目类型不符":
+            enabled_names = "、".join(
+                (t["名称"] if t.get("子类") is None else "%s（%s）" % (t["名称"], "、".join(t["子类"])))
+                for t in project_types
+            ) if project_types else ""
+            return "项目类型不符", "不在已选项目类型范围（%s）" % enabled_names
+        return "通过", "通过"
+
+    df["初筛结果"] = [decide(r)[0] for r in results]
+    df["初筛原因"] = [decide(r)[1] for r in results]
+    df["类型待确认"] = type_pending_flags
+    return df
+
+
+def filter_passed(df: pd.DataFrame) -> pd.DataFrame:
+    """仅保留初筛通过（时间+类型+项目类型均合法）的候选。"""
+    return df[df["初筛结果"] == "通过"].copy()
+
+
+# 初筛结果 Excel 输出列（P3：{时间}_初筛结果.xlsx，各清单一个 sheet）
+SCREENING_EXCEL_COLUMNS = [
+    "项目类型",
+    "公告时间",
+    "公告类型",
+    "所在区县",
+    "采购人",
+    "采购项目名称",
+    "预算金额(元)",
+    "中标金额(元)",
+    "中标单位",
+    "代理机构",
+    "地址链接URL",
+    "相关性初判",
+    "相关性依据",
+    "初筛结果",
+    "初筛原因",
+    "来源文件",
+    "原始行号",
+]
+# 输出列显示名：相关性依据 → 相关性(命中词)（验收口径：含初筛结果/初筛原因/相关性(命中词)/来源列）
+SCREENING_EXCEL_DISPLAY = {"相关性依据": "相关性(命中词)"}
+
+
+def _safe_sheet_title(name: str) -> str:
+    """工作表名：去扩展名 + 去非法字符 + 截断 31 字符（Excel 限制）。"""
+    title = os.path.splitext(os.path.basename(name))[0]
+    title = re.sub(r"[\\/:*?\[\]]", "_", title)
+    title = title[:31] or "清单"
+    return title
+
+
+def write_screening_excel(
+    df: pd.DataFrame,
+    list_dir: str,
+    sources: dict,
+    timestamp: str,
+    output_path: str = None,
+    extra_columns: list = None,
+) -> str:
+    """
+    输出初筛结果 Excel（P3）：{时间}_初筛结果.xlsx，放在清单路径下。
+
+    - 每个来源清单一个 sheet（表名取清单文件名去扩展名），含全量行；
+    - 每行含：初筛结果 / 初筛原因 / 相关性初判 / 相关性依据(命中词) / 来源文件 / 原始行号；
+    - extra_columns（可选，默认 None）：追加到输出列末尾的列名列表
+      （增量模式下传 ["初筛状态", "研判状态"]；不传时行为与既有完全一致）；
+    - 返回输出文件绝对路径；保存失败时抛出中文提示（含被 Excel 占用的处理建议）。
+    """
+    if output_path is None:
+        output_path = os.path.join(list_dir, "%s_初筛结果.xlsx" % timestamp)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    from openpyxl import Workbook
+
+    try:
+        wb = Workbook()
+        wb.remove(wb.active)
+        used_titles = set()
+        # 汇总 sheet（置顶）：仅保留初筛通过且相关性为"待确认"的项目，供用户集中确认
+        pending = df[(df["初筛结果"] == "通过") & (df["相关性初判"] == "待确认")]
+        if len(pending):
+            _write_sheet(wb, "汇总", pending, extra_columns)
+            used_titles.add("汇总")
+        # 无来源信息的行归入"合并清单"sheet
+        source_names = [n for n in sources.keys()]
+        if source_names:
+            for fname in source_names:
+                sub = df[df["来源文件"] == fname]
+                title = _safe_sheet_title(fname)
+                while title in used_titles:
+                    title = title + "_2"
+                used_titles.add(title)
+                _write_sheet(wb, title, sub, extra_columns)
+            # 来源文件不在 sources 中的行（理论不会出现，兜底）
+            rest = df[~df["来源文件"].isin(source_names)]
+            if len(rest):
+                _write_sheet(wb, "合并清单", rest, extra_columns)
+        else:
+            _write_sheet(wb, "清单", df, extra_columns)
+        wb.save(output_path)
+    except PermissionError:
+        raise ExcelToolError(
+            "保存初筛结果失败：%s 可能已被 Excel 打开占用，请关闭 Excel 后重试。" % output_path
+        )
+    except Exception as e:
+        raise ExcelToolError("保存初筛结果失败（%s）：%s" % (output_path, e))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+    return output_path
+
+
+def _write_sheet(wb, title: str, df: pd.DataFrame, extra_columns: list = None) -> None:
+    """将 DataFrame 写入工作簿的单个 sheet（只写初筛结果相关列；extra_columns 追加到末尾）。"""
+    ws = wb.create_sheet(title)
+    cols = [c for c in SCREENING_EXCEL_COLUMNS if c in df.columns]
+    for c in (extra_columns or []):
+        if c in df.columns and c not in cols:
+            cols.append(c)
+    headers = [SCREENING_EXCEL_DISPLAY.get(c, c) for c in cols]
+    ws.append(headers)
+    for _, row in df.iterrows():
+        ws.append([_stringify(row.get(c)) for c in cols])
+    # 简单列宽（不冻结，保持轻量）
+    from openpyxl.utils import get_column_letter
+    for i, h in enumerate(headers, start=1):
+        width = min(max(len(h) * 2 + 2, 12), 40)
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+
+def write_screening_back_to_main(df: pd.DataFrame, sources: dict, main_file: str = None) -> bool:
+    """
+    初筛结果回写主文件（多 Sheet 主文件工作流：不新建初筛结果 Excel）。
+
+    - 来源名为「文件名::Sheet名」时，按 URL 定位主文件对应 Sheet 的行，
+      回写「初筛结果 / 初筛原因 / 相关性(命中词)」三列；
+    - 主文件参数缺省时从 sources 推断唯一文件路径；
+    - 返回值：True=已回写（至少一个 Sheet 生效）；False=未回写（非多 Sheet 来源或主文件不可写）。
+    """
+    if not sources or df is None or df.empty:
+        return False
+    # 仅处理多 Sheet 来源（来源名含 ::）
+    sheet_sources = {src: path for src, path in sources.items() if "::" in str(src)}
+    if not sheet_sources:
+        return False
+
+    # 推断主文件：所有 Sheet 来源指向同一文件（如 政府采购公告.xlsx）
+    paths = set(sheet_sources.values())
+    if len(paths) != 1:
+        return False
+    main_path = paths.pop()
+    if main_file and os.path.normpath(main_file) != os.path.normpath(main_path):
+        main_path = main_file
+
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(main_path)
+    except Exception as e:
+        raise ExcelToolError("打开主文件「%s」失败，请确认文件未被 Excel 占用。详细信息：%s" % (main_path, e))
+
+    # 按来源分组：来源名 → 表头行号（探测）
+    src_header = {}
+    for src in sheet_sources:
+        fname, _, sn = src.partition("::")
+        if sn not in wb.sheetnames:
+            continue
+        ws = wb[sn]
+        header_row = None
+        for r in range(1, min(ws.max_row, 5) + 1):
+            vals = [str(ws.cell(r, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+            if "采购项目名称" in vals:
+                header_row = r
+                break
+        if header_row is None:
+            continue
+        src_header[src] = (ws, header_row)
+
+    if not src_header:
+        wb.close()
+        return False
+
+    # 构建 URL → (Sheet, 行号) 映射
+    url_to_loc = {}
+    for src, (ws, header_row) in src_header.items():
+        col_of = {}
+        for c in range(1, ws.max_column + 1):
+            name = str(ws.cell(header_row, c).value or "").strip()
+            if name:
+                col_of.setdefault(name, c)
+        url_col = col_of.get("地址链接URL")
+        if not url_col:
+            continue
+        for r in range(header_row + 1, ws.max_row + 1):
+            url = str(ws.cell(r, url_col).value or "").strip()
+            if url:
+                url_to_loc[url] = (ws, col_of, r)
+
+    written = 0
+    for _, row in df.iterrows():
+        url = _stringify(row.get("地址链接URL")).strip()
+        if not url or url not in url_to_loc:
+            continue
+        ws, col_of, r = url_to_loc[url]
+        fields = {
+            "初筛结果": row.get("初筛结果"),
+            "初筛原因": row.get("初筛原因"),
+            "相关性(命中词)": row.get("相关性依据"),
+        }
+        for col_name, val in fields.items():
+            c = col_of.get(col_name)
+            if c is not None:
+                ws.cell(r, c).value = _stringify(val) if val is not None else ""
+        written += 1
+
+    if written:
+        try:
+            wb.save(main_path)
+        except PermissionError:
+            wb.close()
+            raise ExcelToolError(
+                "保存主文件失败：%s 可能已被 Excel 打开占用，请关闭 Excel 后重试。" % main_path
+            )
+    wb.close()
+    return written > 0
+
+
+def build_screening_md_table(df: pd.DataFrame) -> str:
+    """
+    生成初筛汇总 markdown 表格（对话中初筛汇报用；研判报告已不含初筛汇总，仅逐项目研判）。
+
+    列：项目类型 | 公告时间 | 公告类型 | 采购项目名称 | 相关性(命中词) | 初筛结果 | 初筛原因 | 来源
+    返回 markdown 表格文本；df 为空时返回"（无初筛数据）"。
+    """
+    if df is None or df.empty:
+        return "（无初筛数据）"
+    header = ["项目类型", "公告时间", "公告类型", "采购项目名称", "相关性(命中词)", "初筛结果", "初筛原因", "来源"]
+    lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
+    for _, row in df.iterrows():
+        cells = [
+            _stringify(row.get("项目类型")),
+            _stringify(row.get("公告时间")),
+            _stringify(row.get("公告类型")),
+            _stringify(row.get("采购项目名称")),
+            _stringify(row.get("相关性依据")),
+            _stringify(row.get("初筛结果")),
+            _stringify(row.get("初筛原因")),
+            "%s / 行%s" % (_stringify(row.get("来源文件")), _stringify(row.get("原始行号"))),
+        ]
+        cells = [c.replace("|", "｜").replace("\n", " ") for c in cells]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def write_result(
+    source_paths,
+    output_path: str,
+    result_map: dict,
+    extra_columns: list = None,
+) -> None:
+    """
+    将研判结果回写到新 Excel：每个来源清单一个工作表，保留原表结构与格式，
+    新增「研判结果」列（及 extra_columns 指定的列，如"项目类型"）。
+
+    【P3 说明】本函数自 P3 起不再被 SKILL.md 调用（研判结论改输出 md 报告），
+    仅保留以兼容历史脚本。
+
+    参数：
+    - source_paths: 来源清单 {文件名: 绝对路径}；兼容传单个字符串路径（自动包一层）
+    - output_path: 输出文件路径
+    - result_map: {(来源文件名, Excel行号): {"项目类型": str, "研判结果": str}}
+      兼容旧格式：单文件时 key 可为 {Excel行号: 文本}，内部自动转换
+    - extra_columns: 在「研判结果」之前插入的列头列表（默认 ["项目类型"]）
+    """
+    if isinstance(source_paths, str):
+        source_paths = {os.path.basename(source_paths): source_paths}
+
+    if not source_paths:
+        raise ExcelToolError("无法回写：未提供任何来源清单文件。")
+
+    extra_columns = extra_columns or ["项目类型"]
+    from openpyxl import load_workbook
+
+    # 规范化 result_map：key -> (来源文件名, 行号)
+    norm = {}
+    for key, val in result_map.items():
+        if isinstance(key, tuple) and len(key) == 2:
+            fname, row_idx = key
+        else:
+            fname, row_idx = list(source_paths.keys())[0], key
+        if isinstance(val, str):
+            val = {"研判结果": val}
+        norm[(fname, int(row_idx))] = val
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    out = None  # 输出工作簿
+
+    for fname, path in source_paths.items():
+        if not os.path.exists(path):
+            raise ExcelToolError("无法回写：源文件不存在：%s" % path)
+        try:
+            wb = load_workbook(path)
+        except Exception as e:
+            raise ExcelToolError("打开源文件「%s」失败，请确认文件未被占用。详细信息：%s" % (fname, e))
+
+        ws = wb.active
+        # 找到表头所在行
+        header_row = None
+        for r in range(1, min(ws.max_row, 5) + 1):
+            vals = [str(ws.cell(row=r, column=c).value or "") for c in range(1, ws.max_column + 1)]
+            if any("采购项目名称" in v for v in vals):
+                header_row = r
+                break
+        if header_row is None:
+            header_row = 1
+
+        # 在「研判结果」前插入 extra_columns（从最后一列之后开始写）
+        new_col = ws.max_column + 1
+        col_of = {}
+        for col_name in list(extra_columns) + ["研判结果"]:
+            ws.cell(row=header_row, column=new_col, value=col_name)
+            if header_row > 1:
+                src_cell = ws.cell(row=header_row, column=1)
+                new_cell = ws.cell(row=header_row, column=new_col)
+                try:
+                    new_cell.font = src_cell.font.copy()
+                    new_cell.fill = src_cell.fill.copy()
+                    new_cell.border = src_cell.border.copy()
+                    new_cell.alignment = src_cell.alignment.copy()
+                except Exception:
+                    pass
+            col_of[col_name] = new_col
+            new_col += 1
+
+        # 回写结果（行号从表头+1 开始）
+        for (src_fname, row_idx), vals in norm.items():
+            if src_fname != fname:
+                continue
+            for col_name, value in vals.items():
+                if col_name in col_of:
+                    ws.cell(row=row_idx, column=col_of[col_name], value=value)
+
+        sheet_title = fname.rsplit(".", 1)[0][:31]
+
+        if out is None:
+            out = wb
+            try:
+                out.active.title = sheet_title
+            except Exception:
+                pass
+        else:
+            import copy as _copy
+            try:
+                out.create_sheet(sheet_title)
+            except Exception:
+                out.create_sheet(sheet_title + "_" + str(len(out.sheetnames)))
+            dst = out[out.sheetnames[-1]]
+            for row in ws.iter_rows():
+                for cell in row:
+                    nc = dst[cell.coordinate]
+                    nc.value = cell.value
+                    nc.font = _copy.copy(cell.font)
+                    nc.fill = _copy.copy(cell.fill)
+                    nc.border = _copy.copy(cell.border)
+                    nc.alignment = _copy.copy(cell.alignment)
+                    nc.number_format = cell.number_format
+            for rng in ws.merged_cells.ranges:
+                dst.merge_cells(str(rng))
+            for col_letter, dim in ws.column_dimensions.items():
+                if dim.width:
+                    dst.column_dimensions[col_letter].width = dim.width
+            wb.close()
+
+    try:
+        out.save(output_path)
+    except PermissionError:
+        raise ExcelToolError(
+            "保存结果文件失败：%s 可能已被 Excel 打开占用，请关闭 Excel 后重试。" % output_path
+        )
+    except Exception as e:
+        raise ExcelToolError("保存结果文件失败：%s" % e)
+    finally:
+        if out is not None:
+            try:
+                out.close()
+            except Exception:
+                pass
+
+
+def build_result_map(df: pd.DataFrame, results: list) -> dict:
+    """
+    将研判结果（按行顺序）绑回原表行号。
+
+    参数：
+    - df: 带原始 Excel 行号列（如含"原始行号"）的 DataFrame
+    - results: 与 df 行顺序一致的研判结果列表
+    返回 {Excel行号: 结果文本}
+    """
+    if len(results) != len(df):
+        raise ExcelToolError("研判结果数量与候选数量不一致，无法回写。")
+    if "原始行号" not in df.columns:
+        raise ExcelToolError("缺少原始行号列，无法正确回写。")
+    return {int(rid): text for rid, text in zip(df["原始行号"], results)}
