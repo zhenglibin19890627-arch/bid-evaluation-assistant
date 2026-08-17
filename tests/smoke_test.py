@@ -87,7 +87,7 @@ check("时间不符文案随窗口（7 天）", reason10 == "公告超过 7 天"
 # ---- 2) 流水线全量运行 ----
 r1 = run_pipeline.run_pipeline(list_dir, bid_dir, prof)
 s1 = r1["summary"]
-check("全量初筛：4 行中 2 行通过（类型/项目类型/时间过滤）", s1["passed_count"] == 2, str(s1["screening"]))
+check("全量初筛：4 行中 1 行通过（电子卖场/类型/项目类型/时间过滤）", s1["passed_count"] == 1, str(s1["screening"]))
 check("标书匹配成功", s1["matched_count"] == 1, r1["items"][0].get("bid_match_way", ""))
 check("评分章节提取成功", not r1["items"][0]["scoring_missing"])
 check("初筛结果 Excel 已生成", bool(r1["screening_excel"]) and os.path.exists(r1["screening_excel"]))

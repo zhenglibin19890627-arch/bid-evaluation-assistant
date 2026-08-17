@@ -688,7 +688,7 @@ def filter_screening(
 
     返回 DataFrame，新增列：
     - 项目类型: 命中的已选项目类型名称（未命中为空）
-    - 初筛结果: 通过 / 时间不符 / 类型不符 / 项目类型不符 / 时间缺失
+    - 初筛结果: 通过 / 时间不符 / 类型不符 / 电子卖场 / 项目类型不符 / 时间缺失
     - 初筛原因: 各过滤项的明确原因（如"公告超过 N 天""不在已选项目类型范围"），通过项为"通过"
     - 相关性初判: 相关 / 待确认（软标记，不参与过滤，仅作研判提示）
     - 相关性依据: 命中的公司关键词，或未命中的说明
@@ -734,7 +734,12 @@ def filter_screening(
 
         # 2) 类型条件
         atype = _stringify(row.get("公告类型"))
-        if atype in VALID_ANNOUNCE_TYPES:
+        if atype == "电子卖场公告":
+            # 电子卖场（竞价/询价/网上超市）平台无招标文件可下载，无法投标 → 直接剔除
+            type_ok = False
+            if results[-1] == "时间通过":
+                results[-1] = "电子卖场"
+        elif atype in VALID_ANNOUNCE_TYPES:
             type_ok = True
         else:
             type_ok = False
@@ -791,6 +796,8 @@ def filter_screening(
     def decide(r):
         if r == "时间不符":
             return "时间不符", "公告超过 %d 天" % (days or 0)
+        if r == "电子卖场":
+            return "电子卖场", "电子卖场公告（平台无招标文件，无法投标）"
         if r == "类型不符":
             return "类型不符", "公告类型不符"
         if r == "时间缺失":
