@@ -16,6 +16,7 @@ collect_round.py —— 增量采集（多 Sheet 主文件，按各城市 Sheet 
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 import os
@@ -29,16 +30,17 @@ ALL_CITIES = ["杭州市", "宁波市", "温州市", "嘉兴市", "湖州市", "
               "金华市", "衢州市", "舟山市", "台州市", "丽水市"]
 
 
-def _sheet_max_date(main_path: Path, city: str):
-    """读取多 Sheet 主文件中城市 Sheet 的最大公告时间日期；失败返回 None。"""
+def _sheet_info(main_path: Path, city: str):
+    """读取多 Sheet 主文件中城市 Sheet 的最大公告时间与已入库 URL 集合。
+    返回 (max_dt 或 None, urls 集合)。"""
     sheet_title = city[:-1] if city.endswith("市") else city
     try:
         wb = openpyxl.load_workbook(main_path)
     except Exception:
-        return None
+        return None, set()
     if sheet_title not in wb.sheetnames:
         wb.close()
-        return None
+        return None, set()
     ws = wb[sheet_title]
     hr = None
     for r in range(1, min(ws.max_row, 5) + 1):
@@ -48,16 +50,19 @@ def _sheet_max_date(main_path: Path, city: str):
             break
     if hr is None:
         wb.close()
-        return None
-    time_col = None
+        return None, set()
+    col_of = {}
     for c in range(1, ws.max_column + 1):
-        if str(ws.cell(hr, c).value or "").strip() == "公告时间":
-            time_col = c
-            break
+        name = str(ws.cell(hr, c).value or "").strip()
+        if name:
+            col_of.setdefault(name, c)
+    time_col = col_of.get("公告时间")
+    url_col = col_of.get("地址链接URL")
     if time_col is None:
         wb.close()
-        return None
+        return None, set()
     max_dt = None
+    urls = set()
     for r in range(hr + 1, ws.max_row + 1):
         v = ws.cell(r, time_col).value
         if isinstance(v, datetime):
@@ -70,8 +75,12 @@ def _sheet_max_date(main_path: Path, city: str):
                     break
                 except ValueError:
                     continue
+        if url_col is not None:
+            u = str(ws.cell(r, url_col).value or "").strip()
+            if u:
+                urls.add(u.lower())
     wb.close()
-    return max_dt
+    return max_dt, urls
 
 
 def _date_range(start: datetime, end: datetime, chunk_days: int):
@@ -112,7 +121,7 @@ def main() -> int:
     print("地市：%s" % "、".join(cities))
     for i, city in enumerate(cities, 1):
         print("\n########## [%d/%d] %s ##########" % (i, len(cities), city))
-        max_dt = _sheet_max_date(main_file, city)
+        max_dt, existing_urls = _sheet_info(main_file, city)
         if max_dt is None:
             print("  ↳ Sheet 无数据或不存在，按最近 3 天起算")
             start = today - timedelta(days=2)
@@ -122,20 +131,36 @@ def main() -> int:
             if (today.date() - start.date()).days > args.max_days:
                 start = today - timedelta(days=args.max_days - 1)
                 print("  ↳ 最后公告日期过早，截断为最近 %d 天" % args.max_days)
+        # 已入库 URL 清单落临时文件，供采集器详情抓取前过滤（跳过重复公告，大幅提速）
+        existing_file = ws / ("_existing_urls_%s.json" % city[:-1] if city.endswith("市") else city)
+        with open(existing_file, "w", encoding="utf-8") as f:
+            json.dump({"urls": sorted(existing_urls)}, f, ensure_ascii=False)
+        print("  ↳ 已入库 URL %d 条，采集时将跳过其详情抓取" % len(existing_urls))
         end = today
         chunks = _date_range(start, end, args.chunk_days)
         print("  ↳ 起算：%s → 今天（共 %d 天，分 %d 批）" % (
             start.date(), (end.date() - start.date()).days + 1, len(chunks)))
-        if len(chunks) == 1 and chunks[0][0] == chunks[0][1]:
-            fetch_cmd = [sys.executable, "scripts/fetch_zfcg.py", "--city", city,
-                         "--date", chunks[0][0].strftime("%Y-%m-%d"), "--workspace", str(ws)]
-        else:
-            fetch_cmd = [sys.executable, "scripts/fetch_zfcg.py", "--city", city,
-                         "--range", chunks[0][0].strftime("%Y-%m-%d"), chunks[0][1].strftime("%Y-%m-%d"),
-                         "--workspace", str(ws)]
-        rc = run(fetch_cmd)
-        if rc != 0:
-            print("  ✗ 采集失败（rc=%d），跳过该地市" % rc)
+        failed = False
+        for ci, (c_start, c_end) in enumerate(chunks, 1):
+            if c_start == c_end:
+                fetch_cmd = [sys.executable, "scripts/fetch_zfcg.py", "--city", city,
+                             "--date", c_start.strftime("%Y-%m-%d"), "--workspace", str(ws),
+                             "--existing-urls", str(existing_file)]
+            else:
+                fetch_cmd = [sys.executable, "scripts/fetch_zfcg.py", "--city", city,
+                             "--range", c_start.strftime("%Y-%m-%d"), c_end.strftime("%Y-%m-%d"),
+                             "--workspace", str(ws), "--existing-urls", str(existing_file)]
+            print("  ↳ 第 %d/%d 批：%s ~ %s" % (ci, len(chunks), c_start, c_end))
+            rc = run(fetch_cmd)
+            if rc != 0:
+                print("  ✗ 第 %d 批采集失败（rc=%d），继续下一批" % (ci, rc))
+                failed = True
+        try:
+            existing_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if failed:
+            print("  ↳ 存在失败批次，跳过合并（批次文件保留，重跑本命令可续）")
             continue
         merge_cmd = [sys.executable, "scripts/merge_to_main.py", "--city", city,
                      "--main-file", str(main_file), "--workspace", str(ws)]

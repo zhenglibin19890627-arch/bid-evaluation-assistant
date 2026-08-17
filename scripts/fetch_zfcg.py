@@ -598,6 +598,65 @@ def fetch_list_data(fetch_dates):
 # Stage 2: Detail Extraction
 # ========================================================================
 
+def load_existing_urls(existing_urls_file: str = None) -> set:
+    """读取已入库公告 URL 集合（性能优化：详情抓取前过滤，避免重复抓已知公告）。
+
+    - existing_urls_file：JSON 文件 {"urls": [...]}（由 collect_round 传入，多 Sheet 主文件场景）；
+    - 无文件时回退扫描分地市主文件 MAIN_FILE（独立使用场景，文件较小）。
+    统一按'去空格小写'归一化比较。
+    """
+    urls = set()
+
+    def norm(u):
+        return (u or '').strip().lower()
+
+    if existing_urls_file and os.path.exists(existing_urls_file):
+        try:
+            with open(existing_urls_file, encoding='utf-8') as f:
+                urls.update(norm(u) for u in (json.load(f).get('urls') or []))
+            return urls
+        except Exception:
+            urls = set()
+    if MAIN_FILE and os.path.exists(MAIN_FILE):
+        try:
+            wb = openpyxl.load_workbook(MAIN_FILE)  # read_only=True removed（Python 3.13 崩溃坑位）
+            ws = wb.active
+            url_col = None
+            for r in range(1, min(ws.max_row, 5) + 1):
+                for c in range(1, ws.max_column + 1):
+                    if str(ws.cell(r, c).value or '').strip() == '地址链接URL':
+                        url_col = c
+                        break
+                if url_col:
+                    break
+            if url_col:
+                for r in range(4, ws.max_row + 1):
+                    v = str(ws.cell(r, url_col).value or '').strip()
+                    if v:
+                        urls.add(norm(v))
+            wb.close()
+        except Exception:
+            pass
+    return urls
+
+
+def filter_existing(all_items, existing: set):
+    """按公告详情 URL（与主文件'地址链接URL'同格式）过滤已入库项；返回 (新项, 跳过数)。"""
+    if not existing:
+        return all_items, 0
+    new_items, skipped = [], 0
+    for item in all_items:
+        aid = item.get('articleId', '')
+        url = f'https://zfcg.czt.zj.gov.cn/site/detail?articleId={urllib.parse.quote(aid)}' if aid else ''
+        if aid and (url.strip().lower() in existing or aid in existing):
+            skipped += 1
+        else:
+            new_items.append(item)
+    if skipped:
+        print(f"\n[增量优化] 跳过已入库 {skipped} 条（无需重复抓详情），仅抓取 {len(new_items)} 条新公告详情。\n")
+    return new_items, skipped
+
+
 def fetch_details(all_items):
     """Fetch detail content and extract structured fields for each item."""
     print("=== Stage 2: Fetching Details ===\n")
@@ -674,7 +733,7 @@ def fetch_details(all_items):
             item['_agency'] = author if any(kw in author for kw in ['公司', '事务所', '代理']) else ''
         purchaser = extract_purchaser(text)
         item['_purchaser'] = purchaser or item.get('purchaseName', '')
-        time.sleep(0.3)
+        time.sleep(0.2)
 
 
 # ========================================================================
@@ -1094,6 +1153,8 @@ def main():
     parser.add_argument('--range', nargs=2, type=str, metavar=('START', 'END'),
                         help='Date range (YYYY-MM-DD YYYY-MM-DD)')
     parser.add_argument('--verify', action='store_true', help='Run validation after collection')
+    parser.add_argument('--existing-urls', type=str, default=None,
+                        help='已入库 URL 清单 JSON（{"urls": [...]}），详情抓取前过滤，跳过重复公告（性能优化）')
     args = parser.parse_args()
 
     # 按 --city 加载地市区县映射并动态生成目标集合（默认丽水市，向后兼容）
@@ -1145,6 +1206,12 @@ def main():
     all_items = fetch_list_data(fetch_dates)
     if not all_items:
         print("No announcements found. Exiting.")
+        return
+
+    # Stage 1.5: 已入库过滤（性能优化：跳过重复公告的详情抓取）
+    all_items, _skipped = filter_existing(all_items, load_existing_urls(args.existing_urls))
+    if not all_items:
+        print("全部为已入库公告，无新增，无需抓取详情。Exiting.")
         return
 
     # Stage 2: Fetch details
